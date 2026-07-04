@@ -186,58 +186,33 @@
 
     <script>
         // CONFIG: CLOUDFLARE WORKER URL
-        // Вставьте сюда адрес вашего воркера (например: https://wallet-api.yourname.workers.dev)
-        const API_URL = "https://mira.networkk.workers.dev/";
+        // এখানে আপনার ওয়ার্কারের লিংক বসান (যেমন: https://wallet-api.yourname.workers.dev)
+        const API_URL = "https://mira.networkk.workers.dev/"; 
 
         const tg = window.Telegram.WebApp;
         tg.ready(); tg.expand();
 
-        // ВАЖНО: tg.initData — это ПОДПИСАННАЯ Telegram'ом строка (initDataUnsafe
-        // такой подписи не содержит и её легко подделать). Мы отправляем именно
-        // initData на сервер при каждом защищённом запросе, а сервер сам
-        // проверяет подпись и достаёт из неё настоящий id пользователя.
-        // Все данные из tg.initDataUnsafe используем ТОЛЬКО для мгновенного
-        // отображения интерфейса — источником истины всегда является ответ сервера.
-
         // LOCAL STATE
-        let appState = {
-            user: { balance: 0, totalEarned: 0, referrals: 0, taskHistory: {} },
-            config: {},
-            leaderboard: [],
-            history: []
+        let appState = { 
+            user: { balance: 0, totalEarned: 0, referrals: 0, dailyAds: {}, taskHistory: {} },
+            config: {}, 
+            leaderboard: [], 
+            history: [] 
         };
 
-        // Экранирование HTML — обязательно перед вставкой ЛЮБЫХ данных,
-        // которые ввёл пользователь (своё имя в Telegram может задать кто угодно,
-        // в том числе вставить туда теги <script> и т.п.)
-        function esc(str) {
-            const div = document.createElement('div');
-            div.innerText = (str === null || str === undefined) ? '' : String(str);
-            return div.innerHTML;
-        }
-
         // API HELPER FUNCTION
-        // action = 'getConfig' / 'getLeaderboard' — публичные, initData не нужен
-        async function api(action, method = 'GET', body = null, needsAuth = true) {
+        async function api(action, method = 'GET', body = null) {
             try {
                 let url = `${API_URL}?action=${action}`;
                 if (method === 'GET' && body) {
-                    Object.keys(body).forEach(k => url += `&${k}=${encodeURIComponent(body[k])}`);
+                    // For GET params
+                    Object.keys(body).forEach(k => url += `&${k}=${body[k]}`);
                 }
-                const headers = {};
-                if (needsAuth) headers['X-Telegram-Init-Data'] = tg.initData;
-                if (method !== 'GET') headers['Content-Type'] = 'application/json';
-
-                const opts = { method, headers };
+                const opts = { method: method };
                 if (method !== 'GET' && body) opts.body = JSON.stringify(body);
-
+                
                 const res = await fetch(url, opts);
-                const data = await res.json();
-                if (!res.ok) {
-                    console.warn(`API ${action} failed:`, data.error);
-                    return { error: data.error || 'Request failed' };
-                }
-                return data;
+                return await res.json();
             } catch (e) {
                 console.error("API Error", e);
                 return null;
@@ -245,50 +220,57 @@
         }
 
         window.onload = async () => {
-            if (!tg.initDataUnsafe || !tg.initDataUnsafe.user || !tg.initData) {
-                toast("Открой это приложение через Telegram");
-                document.getElementById('loader').style.display = 'none';
-                return;
+            // 1. TELEGRAM ID CHECK
+            if (!tg.initDataUnsafe || !tg.initDataUnsafe.user) {
+                // Testing only
+                // tg.initDataUnsafe = { user: { id: "test_123", first_name: "Tester", photo_url: "" }, start_param: "" };
+                // return; 
             }
             const tgUser = tg.initDataUnsafe.user;
 
-            // 2. SET UI IMMEDIATELY (только для быстрого отклика интерфейса,
-            // это ещё не подтверждённые сервером данные)
+            // 2. SET UI IMMEDIATELY
             document.getElementById('u-name').innerText = tgUser.first_name;
             document.getElementById('u-id').innerText = `ID: ${tgUser.id}`;
             if(tgUser.photo_url) document.getElementById('u-img').src = tgUser.photo_url;
 
-            // 3. LOAD LOCAL STORAGE (Cache) — только для мгновенного отображения,
-            // баланс всё равно будет перезаписан ответом сервера ниже
+            // 3. LOAD LOCAL STORAGE (Cache)
             const cached = localStorage.getItem(`app_${tgUser.id}`);
             if(cached) {
-                try { appState = JSON.parse(cached); renderAll(); } catch(e) {}
+                appState = JSON.parse(cached);
+                renderAll(); 
+            } else {
+                appState.user.id = tgUser.id;
             }
-            appState.user.id = tgUser.id;
 
             try {
                 // 4. FETCH CONFIG & LOGIN
                 const [config, user] = await Promise.all([
-                    api('getConfig', 'GET', null, false),
-                    api('login', 'POST', {}) // сервер сам возьмёт имя/фото/refId из initData
+                    api('getConfig'),
+                    api('login', 'POST', {
+                        id: tgUser.id,
+                        firstName: tgUser.first_name,
+                        photoUrl: tgUser.photo_url || '',
+                        refId: tg.initDataUnsafe.start_param
+                    })
                 ]);
 
-                if(config && !config.error) appState.config = config;
-
-                if(user && !user.error) {
+                if(config) appState.config = config;
+                
+                if(user) {
+                    // Merge DB user with local state logic
                     appState.user = { ...appState.user, ...user };
+                    // Ensure local tracking objects exist
+                    if(!appState.user.dailyAds) appState.user.dailyAds = {};
                     if(!appState.user.taskHistory) appState.user.taskHistory = {};
-                } else if (user && user.error) {
-                    toast("Ошибка входа: " + user.error);
                 }
 
                 // 5. FETCH LEADERBOARD
-                const lb = await api('getLeaderboard', 'GET', null, false);
-                if(Array.isArray(lb)) appState.leaderboard = lb;
+                const lb = await api('getLeaderboard');
+                if(lb) appState.leaderboard = lb;
 
                 // 6. FETCH HISTORY
-                const hist = await api('getHistory');
-                if(Array.isArray(hist)) appState.history = hist;
+                const hist = await api('getHistory', 'GET', { id: tgUser.id });
+                if(hist) appState.history = hist;
 
                 // 7. FINALIZE
                 saveLocal();
@@ -323,6 +305,10 @@
             renderAds(); renderTasks(); renderLeaderboard(); renderHistory(); renderMethods(); loadAdScripts();
         }
 
+        // --- ACTIVE TASK STATE ---
+        let runningTask = null;
+        let taskInterval = null;
+
         // --- ADS (Client Side Logic + Server Sync) ---
         function loadAdScripts() {
             (appState.config.adSlots||[]).forEach(s => {
@@ -333,19 +319,15 @@
                 }
             });
         }
-        // Дневной лимит рекламы теперь считает и хранит СЕРВЕР (users/{uid}/dailyAdState).
-        // На клиенте только приблизительно показываем счётчик для UI, полагаясь
-        // на актуальные данные из appState.user, которые обновляются после каждого watchAd.
         function renderAds() {
             const el = document.getElementById('ad-area'); el.innerHTML = '';
-            const adState = appState.user.dailyAdState;
             const today = new Date().toISOString().slice(0,10);
-            const counts = (adState && adState.date === today) ? adState.counts : {};
+            if(appState.user.lastActive !== today) { appState.user.dailyAds = {}; appState.user.lastActive = today; saveLocal(); }
             (appState.config.adSlots||[]).forEach((s, i) => {
                 const limit = appState.config.dailyAdLimit || 10;
-                const done = counts[s.id] || 0;
+                const done = (appState.user.dailyAds && appState.user.dailyAds[s.id]) || 0;
                 const max = done >= limit;
-                el.innerHTML += `<div class="ad-card ${max?'disabled':''}" onclick="${max?'':`watchAd('${esc(s.id)}','${esc(s.network)}')`}"><i class="fas fa-play"></i><h4>Ad Slot ${i+1}</h4><span>${done}/${limit} Watched</span></div>`;
+                el.innerHTML += `<div class="ad-card ${max?'disabled':''}" onclick="${max?'':`watchAd('${s.id}','${s.network}')`}"><i class="fas fa-play"></i><h4>Ad Slot ${i+1}</h4><span>${done}/${limit} Watched</span></div>`;
             });
         }
         function watchAd(id, net) {
@@ -355,23 +337,23 @@
             else if(net==='gigapub' && window.showGiga) p = window.showGiga();
             else { toast("Not Ready"); return; }
 
-            p.then(async () => {
-                // Награду и лимит проверяет и начисляет СЕРВЕР — клиент только
-                // сообщает, какой именно ролик был досмотрен.
-                const res = await api('watchAd', 'POST', { adId: id });
-                if (res && res.success) {
-                    appState.user.balance = res.newBalance;
-                    appState.user.totalEarned = (appState.user.totalEarned || 0) + res.reward;
-                    if(!appState.user.dailyAdState || appState.user.dailyAdState.date !== new Date().toISOString().slice(0,10)) {
-                        appState.user.dailyAdState = { date: new Date().toISOString().slice(0,10), counts: {} };
-                    }
-                    appState.user.dailyAdState.counts[id] = (appState.user.dailyAdState.counts[id]||0) + 1;
-                    saveLocal(); renderAll(); toast(`Success! +${res.reward}`);
+            if (p && typeof p.then === 'function') {
+                p.then(async () => {
+                    const r = appState.config.adReward || 0.5;
+                    // Local Update
+                    appState.user.balance += r;
+                    appState.user.totalEarned += r;
+                    if(!appState.user.dailyAds) appState.user.dailyAds = {};
+                    appState.user.dailyAds[id] = (appState.user.dailyAds[id]||0) + 1;
+                    saveLocal(); renderAll(); toast(`Success! +${r}`);
                     tg.HapticFeedback.notificationOccurred('success');
-                } else {
-                    toast(res?.error || "Network Error");
-                }
-            }).catch(() => toast("Failed/Closed"));
+
+                    // Server Sync
+                    await api('updateBalance', 'POST', { id: appState.user.id, type: 'ad', slotId: id });
+                }).catch(() => toast("Failed/Closed"));
+            } else {
+                toast("Ad integration error");
+            }
         }
 
         // --- TASKS ---
@@ -404,70 +386,120 @@
                     }
                 }
 
-                if(!isDone) btnHtml = `<button id="btn-${k}" class="btn-act btn-start" onclick="runTask('${k}')">Start</button>`;
+                if(!isDone) {
+                    if (runningTask && runningTask.id === k) {
+                        if (runningTask.secondsLeft >= 0) {
+                            btnHtml = `<button id="btn-${k}" class="btn-act btn-wait" disabled>${runningTask.secondsLeft}s</button>`;
+                        } else {
+                            btnHtml = `<button id="btn-${k}" class="btn-act btn-claim" onclick="claimTask('${k}', appState.config.webTasks['${k}'])">Claim</button>`;
+                        }
+                    } else {
+                        btnHtml = `<button id="btn-${k}" class="btn-act btn-start" ${runningTask ? 'disabled style="opacity:0.5; cursor:not-allowed;"' : ''} onclick="runTask('${k}')">Start</button>`;
+                    }
+                }
 
-                const html = `<div class="task-item" style="opacity:${isDone?0.6:1}"><div class="task-left"><img src="${esc(t.icon)||'https://via.placeholder.com/40'}" class="task-icon"><div class="task-info"><h4>${esc(t.name)}</h4><small>+${esc(t.reward)} ${esc(sym)}</small></div></div>${btnHtml}</div>`;
+                const html = `<div class="task-item" style="opacity:${isDone?0.6:1}"><div class="task-left"><img src="${t.icon||'https://via.placeholder.com/40'}" class="task-icon"><div class="task-info"><h4>${t.name}</h4><small>+${t.reward} ${sym}</small></div></div>${btnHtml}</div>`;
                 if(isDone) completed.push(html); else pending.push(html);
             });
             el.innerHTML = pending.join('') + completed.join('');
         }
         function runTask(id) {
+            if (runningTask) {
+                toast("Another task is already running!");
+                return;
+            }
             const t = appState.config.webTasks[id];
             tg.openLink(t.url); tg.HapticFeedback.impactOccurred('medium');
-            const btn = document.getElementById(`btn-${id}`);
-            let s = 15; btn.className = 'btn-act btn-wait'; btn.disabled = true;
-            const i = setInterval(() => {
-                btn.innerText = `${s}s`; s--;
-                if(s < 0) { clearInterval(i); btn.className = 'btn-act btn-claim'; btn.innerText = 'Claim'; btn.disabled = false; btn.onclick = () => claimTask(id); }
+            
+            runningTask = { id: id, secondsLeft: 15 };
+            if (taskInterval) clearInterval(taskInterval);
+            
+            taskInterval = setInterval(() => {
+                if (!runningTask) {
+                    clearInterval(taskInterval);
+                    return;
+                }
+                runningTask.secondsLeft--;
+                const btn = document.getElementById(`btn-${id}`);
+                if (btn) {
+                    if (runningTask.secondsLeft >= 0) {
+                        btn.innerText = `${runningTask.secondsLeft}s`;
+                    }
+                }
+                if (runningTask.secondsLeft < 0) {
+                    clearInterval(taskInterval);
+                    if (btn) {
+                        btn.className = 'btn-act btn-claim';
+                        btn.innerText = 'Claim';
+                        btn.disabled = false;
+                        btn.onclick = () => claimTask(id, t);
+                    }
+                }
             }, 1000);
+            
+            renderTasks();
         }
-        async function claimTask(id) {
-            // Награду и правила (one-time/daily, кулдаун) проверяет СЕРВЕР —
-            // клиент только сообщает, какое задание было выполнено.
-            const res = await api('claimTask', 'POST', { taskId: id });
-            if (res && res.success) {
-                appState.user.balance = res.newBalance;
-                appState.user.totalEarned = (appState.user.totalEarned || 0) + res.reward;
-                if(!appState.user.taskHistory) appState.user.taskHistory = {};
-                appState.user.taskHistory[id] = { ts: Date.now() };
-                saveLocal(); renderAll(); toast(`Claimed! +${res.reward}`); tg.HapticFeedback.notificationOccurred('success');
-            } else {
-                toast(res?.error || "Network Error");
+        async function claimTask(id, t) {
+            runningTask = null;
+            if (taskInterval) {
+                clearInterval(taskInterval);
+                taskInterval = null;
             }
+            
+            // Local Update
+            appState.user.balance += t.reward;
+            appState.user.totalEarned += t.reward;
+            if(!appState.user.taskHistory) appState.user.taskHistory = {};
+            appState.user.taskHistory[id] = { ts: Date.now() };
+            saveLocal(); renderAll(); toast("Claimed!"); tg.HapticFeedback.notificationOccurred('success');
+
+            // Server Sync
+            await api('updateBalance', 'POST', { id: appState.user.id, type: 'task', taskId: id });
         }
 
         // --- WITHDRAW ---
         async function withdraw() {
             const min = appState.config.minWithdrawReferrals || 0;
             if(appState.user.referrals < min) { document.getElementById('w-msg').style.display='block'; document.getElementById('w-msg').innerText=`Need ${min} Referrals!`; return; }
+            
             const amt = parseFloat(document.getElementById('w-amt').value);
             const sym = appState.config.currencySymbol || "TK";
-            if(!amt || amt < 10) { toast("Min 10 "+sym); return; }
+            const method = document.getElementById('w-method').value;
+            const account = document.getElementById('w-acc').value.trim();
+
+            if (!account) { toast("Enter account number"); return; }
+            if (isNaN(amt) || amt <= 0) { toast("Enter valid amount"); return; }
+
+            const selectedMethod = (appState.config.withdrawMethods || []).find(m => m.name === method);
+            const minAmt = selectedMethod ? parseFloat(selectedMethod.min) : 10;
+            
+            if(amt < minAmt) { toast(`Min ${minAmt} ` + sym); return; }
             if(amt > appState.user.balance) { toast("Insufficient Balance"); return; }
 
             toast("Connecting...");
-
-            // Server Call — userId/userName сервер берёт из проверенного initData,
-            // а не из того, что мы тут передаём, так что подделать их нельзя
+            
+            // Server Call
             const res = await api('withdraw', 'POST', {
-                amount: amt,
-                method: document.getElementById('w-method').value,
-                account: document.getElementById('w-acc').value
+                userId: appState.user.id, 
+                userName: appState.user.firstName, 
+                amount: amt, 
+                method: method,
+                account: account
             });
 
             if(res && res.success) {
-                // Баланс берём из ответа сервера — он списал атомарно и точно знает актуальную сумму
-                appState.user.balance = res.newBalance;
-                saveLocal();
-
+                // Local Deduct
+                appState.user.balance -= amt;
+                saveLocal(); 
+                
                 // Refresh History
-                const hist = await api('getHistory');
-                if(Array.isArray(hist)) appState.history = hist;
-
+                const hist = await api('getHistory', 'GET', { id: appState.user.id });
+                if(hist) appState.history = hist;
+                
                 renderAll();
                 toast("Submitted!"); tg.HapticFeedback.notificationOccurred('success');
             } else {
-                toast((res && res.error) || "Network Error");
+                toast(res.message || "Network Error");
             }
         }
 
@@ -481,32 +513,30 @@
             if(top[0]) p.innerHTML += getPodium(top[0], 1);
             if(top[2]) p.innerHTML += getPodium(top[2], 3);
             for(let i=3; i<top.length; i++) {
-                // esc() экранирует firstName/photoUrl — имя в Telegram задаёт
-                // сам пользователь и оно МОЖЕТ содержать вредоносный HTML
-                l.innerHTML += `<div class="lb-item"><span class="lb-rank">#${i+1}</span><img src="${esc(top[i].photoUrl)||'https://via.placeholder.com/40'}" class="lb-img"><div class="lb-name">${esc(top[i].firstName)}</div><div class="lb-val">${esc(top[i].referrals)}</div></div>`;
+                l.innerHTML += `<div class="lb-item"><span class="lb-rank">#${i+1}</span><img src="${top[i].photoUrl||'https://via.placeholder.com/40'}" class="lb-img"><div class="lb-name">${top[i].firstName}</div><div class="lb-val">${top[i].referrals}</div></div>`;
             }
         }
-        function getPodium(u, r) { return `<div class="podium-item rank-${r}"><div class="crown"><i class="fas fa-crown"></i></div><img src="${esc(u.photoUrl)||'https://via.placeholder.com/60'}" class="podium-img"><div class="podium-name">${esc(u.firstName)}</div><div class="podium-score">${esc(u.referrals)} Refs</div></div>`; }
+        function getPodium(u, r) { return `<div class="podium-item rank-${r}"><div class="crown"><i class="fas fa-crown"></i></div><img src="${u.photoUrl||'https://via.placeholder.com/60'}" class="podium-img"><div class="podium-name">${u.firstName}</div><div class="podium-score">${u.referrals} Refs</div></div>`; }
         function renderHistory() {
             const el = document.getElementById('hist-area'); el.innerHTML = '';
             const sym = appState.config.currencySymbol || "TK";
             if(appState.history.length === 0) { el.innerHTML='<p style="text-align:center;color:#aaa">No History</p>'; return; }
             appState.history.forEach(x => {
-                el.innerHTML += `<div class="hist-item ${esc(x.status)}"><div class="hist-info"><h4>${esc(x.method)} - ${esc(x.amount)} ${esc(sym)}</h4><small>${new Date(x.timestamp).toLocaleDateString()}</small></div><span class="status-badge">${esc(x.status)}</span></div>`;
+                el.innerHTML += `<div class="hist-item ${x.status}"><div class="hist-info"><h4>${x.method} - ${x.amount} ${sym}</h4><small>${new Date(x.timestamp).toLocaleDateString()}</small></div><span class="status-badge">${x.status}</span></div>`;
             });
         }
         function renderMethods() {
             const s = document.getElementById('w-method'); if(s.children.length > 0) return;
-            (appState.config.withdrawMethods||[]).forEach(m => s.innerHTML+=`<option value="${esc(m.name)}">${esc(m.name)} (Min ${esc(m.min)})</option>`);
+            (appState.config.withdrawMethods||[]).forEach(m => s.innerHTML+=`<option value="${m.name}">${m.name} (Min ${m.min})</option>`);
         }
         function nav(p, e) {
             document.querySelectorAll('.page').forEach(x => x.classList.remove('active'));
             document.getElementById(p).classList.add('active');
             document.querySelectorAll('.nav i').forEach(x => x.classList.remove('active'));
             e.classList.add('active');
-            if(p==='p-profile') {
-                api('getHistory').then(hist => {
-                    if(Array.isArray(hist)) { appState.history = hist; saveLocal(); renderAll(); }
+            if(p==='p-profile') { 
+                api('getHistory', 'GET', { id: appState.user.id }).then(hist => {
+                    if(hist) { appState.history = hist; saveLocal(); renderAll(); }
                 });
             }
             tg.HapticFeedback.impactOccurred('light');
